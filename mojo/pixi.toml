@@ -1,0 +1,24 @@
+[workspace]
+authors = ["Marius S <39998+winding-lines@users.noreply.github.com>"]
+channels = ["https://conda.modular.com/max", "conda-forge"]
+name = "mlake-datafusion-bridge"
+version = "0.1.0"
+description = "The C ABI the DataFusion TableProvider calls into: Iceberg scan planning and Arrow, in Mojo"
+platforms = ["osx-arm64", "linux-64"]
+
+[dependencies]
+mojo = "==1.1.0"
+
+# The include list is the read stack: iceberg needs avro and parquet (and its
+# `full/` codecs), parquet needs arrow, deflate, thrift and the codecs, arrow
+# needs memory-region, and everything needs threads. They are source paths
+# rather than published tins because a shared library is built from source
+# here, and the sibling working trees are what CI checks out beside this repo.
+[tasks]
+lib = { cmd = "mkdir -p build && mojo build --emit shared-lib src/bridge.mojo -I src -I ../../iceberg.mojo/src -I ../../parquet.mojo/src -I ../../parquet.mojo/full/src -I ../../arrow-mlake.mojo/src -I ../../memory-region.mojo/src -I ../../avro.mojo/src -I ../../deflate.mojo/src -I ../../thrift.mojo/src -I ../../zstd.mojo/src -I ../../snappy.mojo/src -I ../../lz4.mojo/src -I ../../brotli.mojo/src -I ../../hashes.mojo/src -I ../../roaring.mojo/src -I ../../objectstore.mojo/src -I ../../threads.mojo/src -I ../../threads.mojo/compat -o build/libmlake_bridge$SHLIB_EXT" }
+
+[target.osx-arm64.activation.env]
+SHLIB_EXT = ".dylib"
+
+[target.linux-64.activation.env]
+SHLIB_EXT = ".so"

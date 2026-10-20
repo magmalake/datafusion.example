@@ -1,0 +1,16 @@
+[package]
+name = "mlake-datafusion"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrow = { version = "59.3.1", default-features = false, features = ["ffi"] }
+async-trait = "0.1.92"
+datafusion = "55.2.0"
+futures = "0.3.34"
+libloading = "0.9.0"
+tokio = { version = "1.54.0", features = ["rt-multi-thread", "macros"] }
+
+[[bin]]
+name = "mlake-sql"
+path = "src/main.rs"

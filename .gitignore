@@ -1,0 +1,5 @@
+.pixi/
+mojo/.pixi/
+mojo/build/
+rust/target/
+test/fixtures/

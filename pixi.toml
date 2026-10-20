@@ -1,0 +1,27 @@
+[workspace]
+authors = ["Marius S <39998+winding-lines@users.noreply.github.com>"]
+channels = ["conda-forge"]
+name = "datafusion-example"
+version = "0.1.0"
+description = "SQL over Iceberg tables in Rust: a DataFusion TableProvider backed by magmalake's Mojo scan"
+platforms = ["osx-arm64", "linux-64"]
+
+[dependencies]
+# The Rust half. Mojo is not here: the bridge is its own workspace under
+# mojo/, because it needs Modular's channel and a pin this build has no reason
+# to inherit. DataFusion 55 needs Rust 1.94.
+rust = ">=1.94"
+# The fixture: PyIceberg writes the table and reads it back as the oracle.
+python = "3.12.*"
+pyarrow = ">=21,<26"
+pyiceberg = ">=0.8,<1"
+sqlalchemy = ">=2,<3"
+
+[tasks]
+# The bridge first: the provider dlopens it, so a build without it fails at
+# the first query instead of at build time.
+bridge = { cmd = "pixi run --manifest-path mojo/pixi.toml lib" }
+build = { cmd = "cargo build --release --manifest-path rust/Cargo.toml", depends-on = ["bridge"] }
+test = { cmd = "bash test/run_tests.sh", depends-on = ["bridge"] }
+# pixi run sql test/fixtures/db/taxi "SELECT region, count(*) FROM taxi GROUP BY region"
+sql = { cmd = "cargo run --release -q --manifest-path rust/Cargo.toml --bin mlake-sql --", depends-on = ["bridge"] }
