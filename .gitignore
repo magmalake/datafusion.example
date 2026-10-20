@@ -3,3 +3,5 @@ mojo/.pixi/
 mojo/build/
 rust/target/
 test/fixtures/
+bench/target/
+bench/results*.jsonl

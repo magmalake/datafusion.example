@@ -23,3 +23,9 @@ so it is not versioned.
 - **Oracle tests.** Each query runs over the table through the Mojo scan and
   over PyIceberg's own read of it (`oracle.parquet`), and the two results must
   match. The fixture includes a row-level delete and a file with 24 row groups.
+- **A head-to-head with iceberg-datafusion** (`bench/`, `pixi run bench`).
+  It runs the taxibench suite through DataFusion 55.2 over both scans and
+  checks the answers before timing. Single-threaded, the Mojo scan is
+  0.78–1.62× iceberg-datafusion's time, held back by about 5 ms of
+  replanning per ticket. With 10 threads it is 0.19–0.47×, because
+  iceberg-datafusion's scan is a single partition.
