@@ -142,10 +142,85 @@ comparison is not vacuous.
 - **Read only.** iceberg.mojo writes tables, but `insert_into` is not wired
   up.
 
-A natural next experiment is a head-to-head with iceberg-rust's own
-DataFusion integration (`iceberg-datafusion`) over the
-[taxibench](https://github.com/magmalake/taxibench.example) table. The two
-would share an engine and the same queries, and differ only in the scan.
+## Head to head with iceberg-datafusion
+
+`bench/` runs the [taxibench](https://github.com/magmalake/taxibench.example)
+suite through DataFusion twice: once over this provider, once over
+[apache/datafusion-iceberg](https://github.com/apache/datafusion-iceberg)'s
+`IcebergStaticTableProvider`, which is iceberg-rust's DataFusion integration
+since apache/iceberg-rust#3228 moved it out. The two runs share the same
+DataFusion 55.2, the same SQL, the same thread budget, and the same table:
+79,478,796 NYC taxi trips in 24 monthly zstd Parquet files, 1.3 GB, written
+by PyIceberg. Only the scan changes.
+
+```sh
+pixi run bench      # both legs; needs ../taxibench.example's table and iceberg.mojo's shims
+```
+
+`bench/compare.py` checks every answer before it prints a time. Counts and
+zones must match exactly, and sums must agree within 1e-9 relative. All
+sixteen answers below agree. Each figure is the median of runs 2–5, each
+query in its own process, on an Apple M4 (4 performance + 6 efficiency
+cores, 24 GB) running macOS 26.6.2. The revisions are iceberg.mojo
+`244127a`, parquet.mojo `91290f1`, datafusion-iceberg `b641e5e` and
+iceberg-rust `5b82ab9`.
+
+| query | 1 thread: iceberg | 1 thread: mlake | | 10 threads: iceberg | 10 threads: mlake | |
+|---|---:|---:|---:|---:|---:|---:|
+| Q1 count, 1 col, filter | 758 ms | 694 ms | 0.92× | 792 ms | 153 ms | 0.19× |
+| Q2 one quarter (3 of 24 files) | 180 | 168 | 0.93× | 184 | 39 | 0.21× |
+| Q3 cash fares, 2 cols | 517 | 840 | 1.62× | 531 | 158 | 0.30× |
+| Q4 tip ratio, 3 cols | 755 | 1101 | 1.46× | 766 | 215 | 0.28× |
+| Q5 top zones, group-by | 1128 | 878 | 0.78× | 1025 | 236 | 0.23× |
+| Q6 zone revenue 2024 | 842 | 730 | 0.87× | 787 | 166 | 0.21× |
+| Q7 one month, all 19 cols | 185 | 200 | 1.08× | 190 | 89 | 0.47× |
+| Q8 selective, 4 cols | 741 | 1188 | 1.60× | 750 | 221 | 0.30× |
+
+The ratio is mlake ÷ iceberg; below 1 means the Mojo scan is faster.
+
+### Reading the 10-thread column
+
+**The 10-thread column measures parallelism, not scan speed.**
+datafusion-iceberg's `IcebergTableScan` reports a single partition
+(`Partitioning::UnknownPartitioning(1)`). iceberg-rust reads up to `num_cpus`
+data files concurrently inside that one stream, but all of the decoding is
+polled from it, so it uses about one core whatever DataFusion is given: its
+times barely move between the two legs. This provider hands DataFusion one
+partition per ticket, which is why it scales. So the right reading is not
+"the Mojo decoder is five times faster" but "a scan that DataFusion can
+parallelise is".
+
+### Reading the 1-thread column
+
+Single-threaded, the comparison is between the two scans themselves, and it
+is mixed. Unfiltered one-column sums isolate where the time goes:
+
+| probe (1 thread) | iceberg | mlake |
+|---|---:|---:|
+| `sum(trip_distance)` | 171 ms | 670 ms |
+| `sum` of 2 columns | 314 | 855 |
+| `sum` of 3 columns | 477 | 1047 |
+| `sum(trip_distance)`, 24 tickets instead of 87 | — | 346 |
+
+- **Per column, the two decoders cost about the same:** about 150 ms per
+  column for iceberg-rust and about 185 ms for the Mojo scan.
+- **The Mojo scan pays a fixed cost per ticket**, about 5 ms each. The bridge
+  is stateless, so every `mlake_read_split` re-reads the table metadata and
+  re-plans the manifests to find its own file. On this table that is 87
+  replans per query. Planning whole files (`--split-size 1000000000`, 24
+  tickets) halves the one-column probe. What remains is still roughly double
+  iceberg's time. I expect most of it is the same replanning, done 24 times,
+  but I haven't separated it out.
+- **iceberg-rust's row filter is expensive.** Q1 is the probe above plus
+  `trip_distance > 0`, and it costs iceberg 758 ms against 171 ms without the
+  filter. That is why the Mojo scan wins Q1, Q5 and Q6 even with its fixed
+  cost. Turning the Mojo scan's own pushdown off changes its times by only
+  3–5%.
+
+The fixed cost is the obvious thing to remove. One option is a ticket that
+carries its file scan task: the data file, its delete files and the
+residual. A read could then go straight to the Parquet file without
+touching the metadata.
 
 ## License
 

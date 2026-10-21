@@ -1,0 +1,22 @@
+[package]
+name = "taxibench-df"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The taxibench suite through DataFusion twice: over iceberg-datafusion's scan and over magmalake's Mojo scan"
+
+# A crate of its own so that iceberg-rust stays out of the example's
+# dependencies: the example is the provider; this is a measurement of it.
+[dependencies]
+mlake-datafusion = { path = "../rust" }
+datafusion = "55.2.0"
+tokio = { version = "1.54.0", features = ["rt-multi-thread", "macros"] }
+# The DataFusion integration left iceberg-rust in apache/iceberg-rust#3228 and
+# lives in apache/datafusion-iceberg, which is on DataFusion 55 — the engine
+# version the provider is on. Both pinned at the revisions that pair: the
+# iceberg rev is the one datafusion-iceberg's own workspace pins.
+iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "5b82ab99aeaf50bf4f5b3b776ac9cd6380a5f3e3" }
+iceberg-datafusion = { git = "https://github.com/apache/datafusion-iceberg", rev = "b641e5ebe9e92967499ae7e440ba10d7797712df" }
+
+[profile.release]
+debug = "line-tables-only"
