@@ -2,17 +2,17 @@
 //!
 //! ```text
 //!  DataFusion                         ArrowArrayStream            Mojo
-//!  SELECT … FROM taxi ─▶ MlakeTable ─▶ plan ─▶ tickets      iceberg.mojo   planning
-//!                        MlakeExec  ─▶ one partition per ticket
-//!                        partition i ─▶ read_split(ticket i) ─▶ parquet.mojo decoding
+//!  SELECT … FROM taxi ─▶ MlakeTable ─▶ plan ─▶ tasks        iceberg.mojo   planning
+//!                        MlakeExec  ─▶ one partition per task
+//!                        partition i ─▶ plan.read(i) ─▶       parquet.mojo   decoding
 //!                                                          arrow-mlake    C Data Interface
 //! ```
 //!
-//! Planning happens in `scan`, so the number of partitions DataFusion sees
-//! is the number of tickets left after the filter pruned the manifests. Each
-//! partition then reads one ticket on a blocking thread, with the projection
-//! and the filter passed down so that only the selected columns are decoded
-//! and only row groups that can match are read.
+//! Planning happens in `scan`, with the projection and the filter, so the
+//! number of partitions DataFusion sees is the number of file scan tasks left
+//! after the filter pruned the manifests. The plan stays on the Mojo side, and
+//! each partition reads one of its tasks on a blocking thread: only the
+//! selected columns are decoded, and only row groups that can match are read.
 
 pub mod bridge;
 pub mod filter;
@@ -39,9 +39,9 @@ use datafusion::physical_plan::{
 };
 use futures::{StreamExt, TryStreamExt};
 
-use crate::bridge::{Bridge, Ticket};
+use crate::bridge::{Bridge, Plan};
 
-/// Bytes per ticket when not chosen: the bridge's own default.
+/// Bytes per task when not chosen: the bridge's own default.
 pub const DEFAULT_SPLIT_SIZE: i64 = 0;
 
 /// An Iceberg table on the local filesystem, read through the Mojo bridge.
@@ -67,7 +67,7 @@ impl MlakeTable {
         })
     }
 
-    /// Divide data files into tickets of about `bytes` each, so one large
+    /// Divide data files into tasks of about `bytes` each, so one large
     /// file is read by several partitions.
     pub fn with_split_size(mut self, bytes: i64) -> Self {
         self.split_size = bytes;
@@ -116,49 +116,41 @@ impl TableProvider for MlakeTable {
             None => Arc::clone(&self.schema),
         };
         let dsl = filter::conjunction(filters);
+
+        // Read only what the query uses. A query that reads no columns at
+        // all — `count(*)` — still needs row counts, so it asks for one.
+        let mut columns: Vec<String> = projected
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        if columns.is_empty() {
+            columns.push(self.schema.field(0).name().clone());
+        }
+
         let bridge = Arc::clone(&self.bridge);
         let (dir, f, split) = (self.table_dir.clone(), dsl.clone(), self.split_size);
-        let tickets = tokio::task::spawn_blocking(move || bridge.plan(&dir, &f, split))
+        let plan = tokio::task::spawn_blocking(move || bridge.plan(&dir, &columns, &f, split))
             .await
             .map_err(|e| DataFusionError::External(e.into()))??;
-        Ok(Arc::new(MlakeExec::new(
-            Arc::clone(&self.bridge),
-            self.table_dir.clone(),
-            projected,
-            self.schema.field(0).name().clone(),
-            dsl,
-            self.split_size,
-            tickets,
-        )))
+        Ok(Arc::new(MlakeExec::new(projected, dsl, plan)))
     }
 }
 
-/// The physical scan: one partition per ticket.
+/// The physical scan: one partition per file scan task.
 #[derive(Debug)]
 pub struct MlakeExec {
-    bridge: Arc<Bridge>,
-    table_dir: String,
     schema: SchemaRef,
-    first_column: String,
     filter: String,
-    split_size: i64,
-    tickets: Arc<Vec<Ticket>>,
+    plan: Arc<Plan>,
     properties: Arc<PlanProperties>,
 }
 
 impl MlakeExec {
-    fn new(
-        bridge: Arc<Bridge>,
-        table_dir: String,
-        schema: SchemaRef,
-        first_column: String,
-        filter: String,
-        split_size: i64,
-        tickets: Vec<Ticket>,
-    ) -> Self {
-        // Zero tickets is still one (empty) partition: DataFusion expects at
+    fn new(schema: SchemaRef, filter: String, plan: Plan) -> Self {
+        // Zero tasks is still one (empty) partition: DataFusion expects at
         // least one to execute.
-        let partitions = tickets.len().max(1);
+        let partitions = plan.len().max(1);
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(partitions),
@@ -166,19 +158,16 @@ impl MlakeExec {
             Boundedness::Bounded,
         ));
         Self {
-            bridge,
-            table_dir,
             schema,
-            first_column,
             filter,
-            split_size,
-            tickets: Arc::new(tickets),
+            plan: Arc::new(plan),
             properties,
         }
     }
 
-    pub fn tickets(&self) -> usize {
-        self.tickets.len()
+    /// The number of file scan tasks, which is the number of partitions.
+    pub fn tasks(&self) -> usize {
+        self.plan.len()
     }
 }
 
@@ -186,13 +175,13 @@ impl DisplayAs for MlakeExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "MlakeExec: tickets={}", self.tickets.len())?;
+                write!(f, "MlakeExec: tasks={}", self.plan.len())?;
                 if !self.filter.is_empty() {
                     write!(f, ", filter={}", self.filter)?;
                 }
                 Ok(())
             }
-            DisplayFormatType::TreeRender => write!(f, "tickets={}", self.tickets.len()),
+            DisplayFormatType::TreeRender => write!(f, "tasks={}", self.plan.len()),
         }
     }
 }
@@ -230,27 +219,17 @@ impl ExecutionPlan for MlakeExec {
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let schema = Arc::clone(&self.schema);
-        let Some(ticket) = self.tickets.get(partition).cloned() else {
+        if partition >= self.plan.len() {
             let empty = futures::stream::empty();
             return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, empty)));
-        };
-
-        // Read only what the query uses. A query that reads no columns at
-        // all — `count(*)` — still needs row counts, so it asks for one.
-        let mut columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-        if columns.is_empty() {
-            columns.push(self.first_column.clone());
         }
 
-        let bridge = Arc::clone(&self.bridge);
-        let (dir, f, split) = (self.table_dir.clone(), self.filter.clone(), self.split_size);
+        let plan = Arc::clone(&self.plan);
         let out_schema = Arc::clone(&schema);
         let batches = futures::stream::once(async move {
-            let batches = tokio::task::spawn_blocking(move || {
-                bridge.read_split(&dir, &ticket, &columns, &f, split)
-            })
-            .await
-            .map_err(|e| DataFusionError::External(e.into()))??;
+            let batches = tokio::task::spawn_blocking(move || plan.read(partition))
+                .await
+                .map_err(|e| DataFusionError::External(e.into()))??;
             let shaped = batches
                 .into_iter()
                 .map(|b| conform(&b, &out_schema))
