@@ -18,25 +18,12 @@ use datafusion::error::{DataFusionError, Result};
 use libloading::Library;
 
 type FreeFn = unsafe extern "C" fn(isize);
-type PlanFn = unsafe extern "C" fn(isize, isize, isize, isize, isize, isize) -> isize;
+type PlanFn = unsafe extern "C" fn(isize, isize, isize, isize, isize, isize, isize, isize) -> isize;
 type PlanCountFn = unsafe extern "C" fn(isize) -> isize;
-type PlanTicketFn = unsafe extern "C" fn(isize, isize, isize) -> isize;
+type PlanReadFn = unsafe extern "C" fn(isize, isize, isize, isize) -> isize;
 type SchemaFn = unsafe extern "C" fn(isize, isize, isize, isize) -> isize;
-type ReadSplitFn = unsafe extern "C" fn(
-    isize,
-    isize,
-    isize,
-    isize,
-    isize,
-    isize,
-    isize,
-    isize,
-    isize,
-    isize,
-    isize,
-) -> isize;
 
-/// The loaded library and the seven entry points it exports.
+/// The loaded library and the six entry points it exports.
 ///
 /// The function pointers are copied out of the `Library` once and stay valid
 /// for as long as it is loaded, which is as long as this struct lives — the
@@ -45,10 +32,9 @@ pub struct Bridge {
     free: FreeFn,
     plan: PlanFn,
     plan_count: PlanCountFn,
-    plan_ticket: PlanTicketFn,
+    plan_read: PlanReadFn,
     plan_free: FreeFn,
     schema: SchemaFn,
-    read_split: ReadSplitFn,
     _lib: Library,
 }
 
@@ -78,11 +64,6 @@ fn ffi_err(what: &str, e: impl std::fmt::Display) -> DataFusionError {
     DataFusionError::External(format!("mlake bridge: {what}: {e}").into())
 }
 
-/// One planned unit of work: a snapshot, a byte range of one data file.
-/// Opaque here — only the bridge decodes it.
-#[derive(Debug, Clone)]
-pub struct Ticket(pub String);
-
 impl Bridge {
     pub fn load(path: &Path) -> Result<Arc<Self>> {
         // SAFETY: loading a library runs its initialisers; this one is the
@@ -98,10 +79,9 @@ impl Bridge {
                 free: sym!(b"mlake_free"),
                 plan: sym!(b"mlake_plan"),
                 plan_count: sym!(b"mlake_plan_count"),
-                plan_ticket: sym!(b"mlake_plan_ticket"),
+                plan_read: sym!(b"mlake_plan_read"),
                 plan_free: sym!(b"mlake_plan_free"),
                 schema: sym!(b"mlake_schema"),
-                read_split: sym!(b"mlake_read_split"),
                 _lib: lib,
             }))
         }
@@ -143,77 +123,104 @@ impl Bridge {
         Ok(Arc::new(schema))
     }
 
-    /// Plan a scan into tickets. `filter` is the Iceberg filter DSL, empty
-    /// for none.
-    pub fn plan(&self, table_dir: &str, filter: &str, split_size: i64) -> Result<Vec<Ticket>> {
-        let mut err = [0isize; 2];
-        // SAFETY: plain integers in; a plan handle or 0 out.
-        let plan = unsafe {
-            (self.plan)(
-                table_dir.as_ptr() as isize,
-                table_dir.len() as isize,
-                filter.as_ptr() as isize,
-                filter.len() as isize,
-                split_size as isize,
-                err.as_mut_ptr() as isize,
-            )
-        };
-        if plan == 0 {
-            return Err(self.take_error(&err));
-        }
-        // SAFETY: tickets are owned by the plan and copied out before it is
-        // freed.
-        unsafe {
-            let n = (self.plan_count)(plan);
-            let mut out = Vec::with_capacity(n as usize);
-            for i in 0..n {
-                let mut len: isize = 0;
-                let p = (self.plan_ticket)(plan, i, &mut len as *mut isize as isize);
-                let bytes = std::slice::from_raw_parts(p as *const u8, len as usize);
-                out.push(Ticket(String::from_utf8_lossy(bytes).into_owned()));
-            }
-            (self.plan_free)(plan);
-            Ok(out)
-        }
-    }
-
-    /// Every batch of one ticket, with only `columns` (all of them when
-    /// empty) and with `filter` pruning row groups inside the split.
+    /// Plan a scan of `columns` (all of them when empty), pruned by
+    /// `filter`, the Iceberg filter DSL (empty for none).
     ///
-    /// Blocking: call it from a blocking thread, never from an async task.
-    pub fn read_split(
-        &self,
+    /// Blocking: it reads the table's metadata and manifests.
+    pub fn plan(
+        self: &Arc<Self>,
         table_dir: &str,
-        ticket: &Ticket,
         columns: &[String],
         filter: &str,
         split_size: i64,
-    ) -> Result<Vec<RecordBatch>> {
+    ) -> Result<Plan> {
         let cols = columns.join("\n");
-        let mut stream = FFI_ArrowArrayStream::empty();
         let mut err = [0isize; 2];
-        // SAFETY: the bridge moves an `ArrowArrayStream` into `stream`.
-        let ok = unsafe {
-            (self.read_split)(
+        // SAFETY: plain integers in; a plan handle or 0 out.
+        let handle = unsafe {
+            (self.plan)(
                 table_dir.as_ptr() as isize,
                 table_dir.len() as isize,
-                ticket.0.as_ptr() as isize,
-                ticket.0.len() as isize,
                 cols.as_ptr() as isize,
                 cols.len() as isize,
                 filter.as_ptr() as isize,
                 filter.len() as isize,
                 split_size as isize,
+                err.as_mut_ptr() as isize,
+            )
+        };
+        if handle == 0 {
+            return Err(self.take_error(&err));
+        }
+        // SAFETY: a live handle.
+        let tasks = unsafe { (self.plan_count)(handle) } as usize;
+        Ok(Plan {
+            bridge: Arc::clone(self),
+            handle,
+            tasks,
+        })
+    }
+}
+
+/// A planned scan, held on the Mojo side: its file scan tasks and what
+/// reading them needs. Freed when dropped.
+pub struct Plan {
+    bridge: Arc<Bridge>,
+    handle: isize,
+    tasks: usize,
+}
+
+// SAFETY: the bridge only reads a plan after `mlake_plan` returns, so it may
+// be read from any number of threads at once. The only write is the free in
+// `drop`, which `&mut self` keeps from overlapping a read.
+unsafe impl Send for Plan {}
+unsafe impl Sync for Plan {}
+
+impl std::fmt::Debug for Plan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Plan({} tasks)", self.tasks)
+    }
+}
+
+impl Plan {
+    /// The number of tasks: one DataFusion partition each.
+    pub fn len(&self) -> usize {
+        self.tasks
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tasks == 0
+    }
+
+    /// Every batch of task `index`, with the columns and the filter residual
+    /// the plan was made with.
+    ///
+    /// Blocking: call it from a blocking thread, never from an async task.
+    pub fn read(&self, index: usize) -> Result<Vec<RecordBatch>> {
+        let mut stream = FFI_ArrowArrayStream::empty();
+        let mut err = [0isize; 2];
+        // SAFETY: the bridge moves an `ArrowArrayStream` into `stream`.
+        let ok = unsafe {
+            (self.bridge.plan_read)(
+                self.handle,
+                index as isize,
                 &mut stream as *mut FFI_ArrowArrayStream as *mut c_void as isize,
                 err.as_mut_ptr() as isize,
             )
         };
         if ok == 0 {
-            return Err(self.take_error(&err));
+            return Err(self.bridge.take_error(&err));
         }
         let reader = ArrowArrayStreamReader::try_new(stream).map_err(|e| ffi_err("stream", e))?;
         reader
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| ffi_err("batch", e))
+    }
+}
+
+impl Drop for Plan {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from `mlake_plan` and is freed once.
+        unsafe { (self.bridge.plan_free)(self.handle) }
     }
 }

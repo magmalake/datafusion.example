@@ -40,31 +40,33 @@ DataFusion in place of DuckDB.
   DataFusion (Rust)                  ArrowArrayStream               Mojo (shared library)
   ─────────────────                  ────────────────               ─────────────────────
   SELECT … WHERE id < 5
-    MlakeTable::scan  ──filter──▶  mlake_plan            iceberg.mojo   manifests pruned
-                      ◀─tickets─                                        into tickets
+    MlakeTable::scan  ──columns, filter──▶  mlake_plan    iceberg.mojo   manifests pruned
+                      ◀──── plan handle ───                             into file scan tasks
     MlakeExec
-      partition 0 ──ticket, columns, filter──▶ mlake_read_split   parquet.mojo   row groups
-      partition 1 ──ticket, columns, filter──▶ mlake_read_split                  pruned, decoded
-      …                ◀── batches, in place ──                   arrow-mlake    C Data Interface
+      partition 0 ──── plan, task 0 ────▶ mlake_plan_read  parquet.mojo   row groups
+      partition 1 ──── plan, task 1 ────▶ mlake_plan_read                 pruned, decoded
+      …           ◀── batches, in place ──                 arrow-mlake    C Data Interface
 ```
 
 - **`mojo/src/bridge.mojo`** is the C interface, built with
   `mojo build --emit shared-lib`. It is the Iceberg half of
   duckdb.extension's bridge, plus the column selection and filter that a
   query engine pushes down. It takes and returns only integers (addresses and
-  lengths), and it is stateless. A scan is planned into **tickets**, each one
-  a snapshot plus a byte range of one data file, and every read is a fresh
-  scan of one ticket. The module docstring explains why: this Mojo has no
-  globals and cannot keep a reader alive between two calls from C.
+  lengths). `mlake_plan` plans the scan once and returns a handle to the
+  plan, which stays on the Mojo side: its **file scan tasks** (a data file or
+  a byte range of one, its delete files, the filter's residual) and the
+  schema, specs and name mapping a read needs. `mlake_plan_read` reads one
+  task from it, without touching the table metadata again, and any number of
+  threads may read from one plan at once.
 - **`rust/src/bridge.rs`** loads the library with `libloading` and wraps each
-  call. Arrow structures are allocated on the Rust side
+  call. A `Plan` owns the handle and frees it when dropped. Arrow structures are allocated on the Rust side
   (`FFI_ArrowSchema::empty()`, `FFI_ArrowArrayStream::empty()`); the bridge
   moves its export into them, and they are freed by their own `release`
   callbacks.
 - **`rust/src/lib.rs`** is the `TableProvider` and its `ExecutionPlan`.
-  Planning happens in `scan`, so DataFusion sees one partition per ticket
-  that survived the filter. Each partition reads its ticket on a blocking
-  thread, asking only for the columns the query uses.
+  Planning happens in `scan`, with the columns the query uses, so DataFusion
+  sees one partition per task that survived the filter. Each partition reads
+  its task on a blocking thread.
 - **`rust/src/filter.rs`** translates DataFusion expressions into the Iceberg
   filter DSL the Mojo scan reads (`["and", ["<", "id", 5], ["=", "ok",
   true]]`). It covers comparisons, `IN`, `IS NULL`, `AND`/`OR`/`NOT`,
@@ -84,7 +86,7 @@ drops a row the SQL would keep:
 
 ```sh
 pixi run sql --split-size 4096 --explain test/fixtures/db/taxi "SELECT id FROM taxi WHERE id < 5"
-#   MlakeExec: tickets=1, filter=["<","id",5]        (6 tickets without the filter)
+#   MlakeExec: tasks=1, filter=["<","id",5]        (6 tasks without the filter)
 ```
 
 ## Running it
@@ -121,7 +123,7 @@ The queries cover:
 - grouped aggregates over nulls and timestamps;
 - ten pushed-down filters;
 - filters that cannot be pushed down;
-- a check that a filter really reduces the number of tickets.
+- a check that a filter really reduces the number of tasks.
 
 Swapping `<` for `>` in the translation makes the suite fail, which shows the
 comparison is not vacuous.
@@ -135,7 +137,7 @@ comparison is not vacuous.
 - **Flat schemas are what the fixture exercises.** Nested columns cross the C
   Data Interface (iceberg.mojo tests them against pyarrow), but the filter
   translation only addresses top-level columns.
-- **`LIMIT` is not pushed down.** Each ticket is read whole, and DataFusion
+- **`LIMIT` is not pushed down.** Each task is read whole, and DataFusion
   stops pulling once it has enough rows.
 - **No statistics.** DataFusion plans joins without row counts from the
   manifests, though they are there to be reported.
@@ -167,14 +169,14 @@ iceberg-rust `5b82ab9`.
 
 | query | 1 thread: iceberg | 1 thread: mlake | | 10 threads: iceberg | 10 threads: mlake | |
 |---|---:|---:|---:|---:|---:|---:|
-| Q1 count, 1 col, filter | 758 ms | 694 ms | 0.92× | 792 ms | 153 ms | 0.19× |
-| Q2 one quarter (3 of 24 files) | 180 | 168 | 0.93× | 184 | 39 | 0.21× |
-| Q3 cash fares, 2 cols | 517 | 840 | 1.62× | 531 | 158 | 0.30× |
-| Q4 tip ratio, 3 cols | 755 | 1101 | 1.46× | 766 | 215 | 0.28× |
-| Q5 top zones, group-by | 1128 | 878 | 0.78× | 1025 | 236 | 0.23× |
-| Q6 zone revenue 2024 | 842 | 730 | 0.87× | 787 | 166 | 0.21× |
-| Q7 one month, all 19 cols | 185 | 200 | 1.08× | 190 | 89 | 0.47× |
-| Q8 selective, 4 cols | 741 | 1188 | 1.60× | 750 | 221 | 0.30× |
+| Q1 count, 1 col, filter | 776 ms | 532 ms | 0.68× | 789 ms | 126 ms | 0.16× |
+| Q2 one quarter (3 of 24 files) | 186 | 160 | 0.86× | 182 | 37 | 0.20× |
+| Q3 cash fares, 2 cols | 533 | 677 | 1.27× | 526 | 122 | 0.23× |
+| Q4 tip ratio, 3 cols | 781 | 933 | 1.19× | 756 | 185 | 0.24× |
+| Q5 top zones, group-by | 1128 | 705 | 0.63× | 1019 | 203 | 0.20× |
+| Q6 zone revenue 2024 | 839 | 664 | 0.79× | 779 | 152 | 0.19× |
+| Q7 one month, all 19 cols | 184 | 204 | 1.11× | 188 | 86 | 0.46× |
+| Q8 selective, 4 cols | 737 | 988 | 1.34× | 737 | 188 | 0.26× |
 
 The ratio is mlake ÷ iceberg; below 1 means the Mojo scan is faster.
 
@@ -186,41 +188,40 @@ datafusion-iceberg's `IcebergTableScan` reports a single partition
 data files concurrently inside that one stream, but all of the decoding is
 polled from it, so it uses about one core whatever DataFusion is given: its
 times barely move between the two legs. This provider hands DataFusion one
-partition per ticket, which is why it scales. So the right reading is not
+partition per task, which is why it scales. So the right reading is not
 "the Mojo decoder is five times faster" but "a scan that DataFusion can
 parallelise is".
 
 ### Reading the 1-thread column
 
 Single-threaded, the comparison is between the two scans themselves, and it
-is mixed. Unfiltered one-column sums isolate where the time goes:
+is mixed. Unfiltered sums isolate where the time goes:
 
-| probe (1 thread) | iceberg | mlake |
-|---|---:|---:|
-| `sum(trip_distance)` | 171 ms | 670 ms |
-| `sum` of 2 columns | 314 | 855 |
-| `sum` of 3 columns | 477 | 1047 |
-| `sum(trip_distance)`, 24 tickets instead of 87 | — | 346 |
+| probe (1 thread) | iceberg | mlake | mlake, before plan handles |
+|---|---:|---:|---:|
+| `sum(trip_distance)` | 163 ms | 454 ms | 670 ms |
+| `sum` of 2 columns | 302 | 638 | 855 |
+| `sum` of 3 columns | 458 | 831 | 1047 |
+| `sum(trip_distance)`, 24 tasks instead of 87 | — | 275 | 346 |
 
 - **Per column, the two decoders cost about the same:** about 150 ms per
   column for iceberg-rust and about 185 ms for the Mojo scan.
-- **The Mojo scan pays a fixed cost per ticket**, about 5 ms each. The bridge
-  is stateless, so every `mlake_read_split` re-reads the table metadata and
-  re-plans the manifests to find its own file. On this table that is 87
-  replans per query. Planning whole files (`--split-size 1000000000`, 24
-  tickets) halves the one-column probe. What remains is still roughly double
-  iceberg's time. I expect most of it is the same replanning, done 24 times,
-  but I haven't separated it out.
+- **The Mojo scan pays a fixed cost per task**, about 2.5 ms each. It used to
+  be about 5 ms. The bridge used to keep nothing between calls, so every read
+  reopened the table metadata and replanned the manifests to find its own
+  task, which cost about 3 ms. The plan now stays on the Mojo side and a read
+  goes straight to its file, which took 160–220 ms off every query that reads
+  the whole table.
+- **What is left is inside the read itself.** It is not the Parquet footer:
+  reading and parsing the footers for all 87 tasks takes 12 ms. It is not
+  the byte range either: a task fetches only the row groups it owns. Reading
+  the 87 tasks straight through `read_data_file`, with no DataFusion and no
+  bridge, takes 433 ms against 275 ms for the same rows as 24 whole files,
+  so the cost is per call somewhere in iceberg.mojo or parquet.mojo. I
+  haven't found it yet.
 - **iceberg-rust's row filter is expensive.** Q1 is the probe above plus
-  `trip_distance > 0`, and it costs iceberg 758 ms against 171 ms without the
-  filter. That is why the Mojo scan wins Q1, Q5 and Q6 even with its fixed
-  cost. Turning the Mojo scan's own pushdown off changes its times by only
-  3–5%.
-
-The fixed cost is the obvious thing to remove. One option is a ticket that
-carries its file scan task: the data file, its delete files and the
-residual. A read could then go straight to the Parquet file without
-touching the metadata.
+  `trip_distance > 0`, and it costs iceberg 776 ms against 163 ms without the
+  filter. That is why the Mojo scan wins Q1, Q5 and Q6.
 
 ## License
 

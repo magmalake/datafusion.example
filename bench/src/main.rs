@@ -15,7 +15,7 @@
 //! and allocators for each other. Prints one JSON line: every run's
 //! wall-clock time, and the answer as strings for `bench/compare.py`.
 //!
-//! `--split-size` sets the Mojo scan's bytes per ticket (0, the default, is
+//! `--split-size` sets the Mojo scan's bytes per task (0, the default, is
 //! the bridge's 16 MiB); it is ignored by the iceberg scan.
 
 use std::sync::Arc;

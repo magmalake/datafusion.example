@@ -127,22 +127,22 @@ async fn filters_it_cannot_push_down_are_still_applied() {
 }
 
 #[tokio::test]
-async fn filters_prune_tickets() {
+async fn filters_prune_tasks() {
     let ctx = context().await;
-    let tickets = |plan: String| -> usize {
+    let tasks = |plan: String| -> usize {
         let at = plan
-            .find("MlakeExec: tickets=")
+            .find("MlakeExec: tasks=")
             .expect("an MlakeExec in the plan");
-        let rest = &plan[at + "MlakeExec: tickets=".len()..];
+        let rest = &plan[at + "MlakeExec: tasks=".len()..];
         rest[..rest.find(|c: char| !c.is_ascii_digit()).unwrap()]
             .parse()
             .unwrap()
     };
-    let all = tickets(rows(&ctx, "EXPLAIN SELECT id FROM taxi").await);
-    let few = tickets(rows(&ctx, "EXPLAIN SELECT id FROM taxi WHERE id < 5").await);
+    let all = tasks(rows(&ctx, "EXPLAIN SELECT id FROM taxi").await);
+    let few = tasks(rows(&ctx, "EXPLAIN SELECT id FROM taxi WHERE id < 5").await);
     assert!(
         all > 1,
-        "split planning should divide the fixture, got {all} tickets"
+        "split planning should divide the fixture, got {all} tasks"
     );
-    assert!(few < all, "id < 5 should prune tickets: {few} of {all}");
+    assert!(few < all, "id < 5 should prune tasks: {few} of {all}");
 }

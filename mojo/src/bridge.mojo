@@ -9,23 +9,32 @@ query engine needs and DuckDB's table function did not ask for: a column
 selection and a filter, both pushed down into the scan so that pruning happens
 in the manifests and the row groups rather than after decoding.
 
-## Why the API is stateless
+## A plan is an object, and reads are against it
 
-The natural design would hand Rust an open scan and let it pull batches. This
-Mojo cannot: `alloc` has no placement-init for a type with a destructor, and
-there are no module-level globals, so there is no way to keep a `BatchReader`
-alive between two calls from C.
+`mlake_plan` opens the table, plans it once, and returns a handle to the
+result: the file scan tasks, each one a data file (or a byte range of one),
+its delete files and its residual filter, together with the schema, column
+ids, partition specs and name mapping that a read needs. Each task is one
+DataFusion partition, and `mlake_plan_read` reads one task from the handle.
 
-What survives the boundary instead is a **plan** — a list of tickets, each a
-string naming a snapshot, a file and a byte range — and every read is a fresh
-scan of exactly one ticket. DataFusion gets one partition per ticket, and each
-partition is read on its own thread.
+An earlier version handed out each task as a string (snapshot, offset, path)
+and kept nothing between calls, so every read reopened the metadata and
+replanned the manifests to find its own task again. On the 87 tasks of the
+taxibench table that cost about 3 ms per read. Holding the plan removes it:
+a read goes straight to its Parquet file.
+
+The handle is only read after `mlake_plan` returns, so any number of threads
+may call `mlake_plan_read` on it at once. It is freed by `mlake_plan_free`,
+which must not overlap with any read.
 
 ## Strings in
 
 Every string argument is a (pointer, length) pair of UTF-8. `columns` is a
 newline-separated list of column names, empty for all of them. `filter` is the
-JSON filter DSL `iceberg.expressions.parse_filter` reads, empty for none.
+JSON filter DSL `iceberg.expressions.parse_filter` reads, empty for none. Both
+are given once, to `mlake_plan`: the column selection decides what a read
+decodes, and the filter decides which tasks there are and what each task's
+residual is.
 
 ## Errors
 
@@ -51,11 +60,14 @@ from iceberg.catalog.filesystem import find_latest_metadata
 from iceberg.io import FileIO
 from iceberg.metadata import TableMetadata
 from iceberg.nested import empty_tree
-from iceberg.read import ScanOptions
-from iceberg.scan import TableScan
+from iceberg.read import NameMapping, ScanOptions, ScanResult, read_data_file
+from iceberg.read import is_metadata_column
+from iceberg.scan import FileScanTask, TableScan
+from iceberg.schema import Schema
+from iceberg.transforms import PartitionSpec
 
 comptime DEFAULT_SPLIT_SIZE = 16 * 1024 * 1024
-"""Target bytes per ticket when the caller does not choose.
+"""Target bytes per task when the caller does not choose.
 
 Without splitting the unit of work is a whole data file, so one large file is
 one DataFusion partition no matter how many threads are free.
@@ -107,8 +119,7 @@ def _out(s: String) -> Int:
 
 
 def _fail(err: Int, message: String) -> Int:
-    """Park a message on the caller's two words and return the failure value.
-    """
+    """Park a message on the caller's two words and return the failure value."""
     if err != 0:
         var slot = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=err)
         slot[unsafe_offset=0] = _out(message)
@@ -143,7 +154,9 @@ def _move_into(src: Int, dst: Int, words: Int, free_shell: Bool):
 def mlake_free(ptr: Int) abi("C") -> None:
     """Free one string this library returned. Not for plans or streams."""
     if ptr != 0:
-        Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=ptr).unsafe_free()
+        Pointer[UInt8, MutUntrackedOrigin](
+            unsafe_from_address=ptr
+        ).unsafe_free()
 
 
 # ── opening a table ─────────────────────────────────────────────────────────
@@ -190,89 +203,106 @@ def _schema_into(scan: TableScan, out_ptr: Int) raises:
 
 
 # ── the plan ────────────────────────────────────────────────────────────────
-# Layout, all 8-byte words: [n, (ptr, len) * n]. A plain array rather than a
-# Mojo collection because it has to stay valid between two calls from C, and
-# nothing with a destructor can.
+struct _Plan(Movable):
+    """Everything a read needs, resolved once from the metadata.
+
+    These are the arguments `TableScan` would otherwise work out again on
+    every read: `read_data_file` takes them loose, which is what lets a task
+    be read without its scan.
+    """
+
+    var io: FileIO
+    var tasks: List[FileScanTask]
+    var specs: List[PartitionSpec]
+    """One per task: the spec that task's data file was written with."""
+    var schema: Schema
+    """The snapshot's whole schema; `ids` picks the columns out of it."""
+    var ids: List[Int]
+    var meta_columns: List[String]
+    var mapping: NameMapping
+    var case_sensitive: Bool
+
+    def __init__(out self, scan: TableScan) raises:
+        self.io = scan.io.copy()
+        self.tasks = scan.plan_files()
+        self.specs = List[PartitionSpec]()
+        for k in range(len(self.tasks)):
+            var id = self.tasks[k].spec_id
+            if scan.metadata.has_spec(id):
+                self.specs.append(scan.metadata.spec_by_id(id))
+            else:
+                self.specs.append(PartitionSpec.unpartitioned(id))
+        self.schema = scan.current_schema()
+        self.ids = List[Int]()
+        self.meta_columns = List[String]()
+        if len(scan.selected) == 0:
+            var cols = self.schema.columns()
+            for k in range(len(cols)):
+                self.ids.append(cols[k].id)
+        else:
+            for k in range(len(scan.selected)):
+                ref name = scan.selected[k]
+                if is_metadata_column(name):
+                    self.meta_columns.append(name)
+                else:
+                    self.ids.append(self.schema.find_by_name(name).id)
+        self.mapping = scan.name_mapping()
+        self.case_sensitive = scan.case_sensitive
+
+
+def _plan_at(plan: Int) raises -> Pointer[_Plan, MutUntrackedOrigin]:
+    if plan == 0:
+        raise Error("mlake: no plan")
+    return Pointer[_Plan, MutUntrackedOrigin](unsafe_from_address=plan)
 
 
 @export("mlake_plan")
 def mlake_plan(
     dir_ptr: Int,
     dir_len: Int,
+    columns_ptr: Int,
+    columns_len: Int,
     filter_ptr: Int,
     filter_len: Int,
     split_size: Int,
     err: Int,
 ) abi("C") -> Int:
-    """Plan a scan; returns a handle whose tickets are the units of work.
+    """Plan a scan; returns a handle whose tasks are the units of work.
 
     Planning reads manifests, not data files: with a filter, partitions and
     files whose column bounds cannot match are dropped here, before any
-    partition is created on the Rust side.
+    partition is created on the Rust side. An empty table is a plan with no
+    tasks, not an error.
     """
     try:
-        var table_dir = _in(dir_ptr, dir_len)
         var scan = _configure(
-            _open(table_dir), String(), _in(filter_ptr, filter_len)
+            _open(_in(dir_ptr, dir_len)),
+            _in(columns_ptr, columns_len),
+            _in(filter_ptr, filter_len),
         ).with_split_size(_split_size(split_size))
-        if not scan.has_any_snapshot():
-            # An empty table is not an error: zero tickets is a complete plan.
-            var empty = unsafe_alloc[Int](1)
-            empty[unsafe_offset=0] = 0
-            return Int(empty)
-
-        var snapshot_id = scan.snapshot().snapshot_id
-        var tasks = scan.plan_files()
-        var words = unsafe_alloc[Int](1 + 2 * len(tasks))
-        words[unsafe_offset=0] = len(tasks)
-        for i in range(len(tasks)):
-            ref t = tasks[i]
-            var ticket = (
-                String(snapshot_id)
-                + String("|")
-                + String(t.start)
-                + String("|")
-                + String(t.length)
-                + String("|")
-                + t.data_file.file_path
-            )
-            words[unsafe_offset=1 + 2 * i] = _out(ticket)
-            words[unsafe_offset=2 + 2 * i] = ticket.byte_length()
-        return Int(words)
+        var p = unsafe_alloc[_Plan](1)
+        p.unsafe_write(_Plan(scan))
+        return Int(p)
     except e:
         return _fail(err, String(e))
 
 
 @export("mlake_plan_count")
 def mlake_plan_count(plan: Int) abi("C") -> Int:
-    if plan == 0:
+    """How many tasks the plan has: one DataFusion partition each."""
+    try:
+        return len(_plan_at(plan)[].tasks)
+    except:
         return 0
-    return Pointer[Int, MutUntrackedOrigin](unsafe_from_address=plan)[]
-
-
-@export("mlake_plan_ticket")
-def mlake_plan_ticket(plan: Int, i: Int, len_out: Int) abi("C") -> Int:
-    """The `i`th ticket. The plan owns it; do not free it separately."""
-    if plan == 0:
-        return 0
-    var words = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=plan)
-    if i < 0 or i >= words[unsafe_offset=0]:
-        return 0
-    if len_out != 0:
-        Pointer[Int, MutUntrackedOrigin](unsafe_from_address=len_out)[] = words[
-            unsafe_offset=2 + 2 * i
-        ]
-    return words[unsafe_offset=1 + 2 * i]
 
 
 @export("mlake_plan_free")
 def mlake_plan_free(plan: Int) abi("C") -> None:
     if plan == 0:
         return
-    var words = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=plan)
-    for i in range(words[unsafe_offset=0]):
-        mlake_free(words[unsafe_offset=1 + 2 * i])
-    words.unsafe_free()
+    var p = Pointer[_Plan, MutUntrackedOrigin](unsafe_from_address=plan)
+    p.unsafe_deinit_pointee()
+    p.unsafe_free()
 
 
 # ── the schema ──────────────────────────────────────────────────────────────
@@ -289,76 +319,51 @@ def mlake_schema(
         return _fail(err, String(e))
 
 
-# ── reading one ticket ──────────────────────────────────────────────────────
-def _decode_ticket(ticket: String) raises -> Tuple[Int64, Int64, Int64, String]:
-    """Split on the first three bars; the rest is the path, which may contain
-    one of its own."""
-    var bytes = ticket.as_bytes()
-    var cuts = List[Int]()
-    for i in range(len(bytes)):
-        if bytes[i] == UInt8(124):  # "|"
-            cuts.append(i)
-            if len(cuts) == 3:
-                break
-    if len(cuts) < 3:
-        raise Error(
-            "mlake: malformed ticket, expected"
-            " '<snapshot>|<start>|<length>|<path>'"
-        )
-    var snap = Int64(atol(String(unsafe_from_utf8=bytes[: cuts[0]])))
-    var start = Int64(
-        atol(String(unsafe_from_utf8=bytes[cuts[0] + 1 : cuts[1]]))
-    )
-    var length = Int64(
-        atol(String(unsafe_from_utf8=bytes[cuts[1] + 1 : cuts[2]]))
-    )
-    var path = String(unsafe_from_utf8=bytes[cuts[2] + 1 :])
-    return (snap, start, length, path^)
-
-
-@export("mlake_read_split")
-def mlake_read_split(
-    dir_ptr: Int,
-    dir_len: Int,
-    ticket_ptr: Int,
-    ticket_len: Int,
-    columns_ptr: Int,
-    columns_len: Int,
-    filter_ptr: Int,
-    filter_len: Int,
-    split_size: Int,
-    out_ptr: Int,
-    err: Int,
+# ── reading one task ────────────────────────────────────────────────────────
+@export("mlake_plan_read")
+def mlake_plan_read(
+    plan: Int, index: Int, out_ptr: Int, err: Int
 ) abi("C") -> Int:
-    """Fill the caller's `ArrowArrayStream` with one ticket's rows; 1 on
+    """Fill the caller's `ArrowArrayStream` with task `index`'s rows; 1 on
     success.
 
-    Planned at the ticket's own snapshot rather than at whatever is current,
-    so a query that started before a commit keeps reading the table it was
-    planned against. `split_size` and `filter` must be the ones the plan was
-    made with: the split decides which byte range the ticket names, and the
-    filter's residual is what prunes row groups inside it.
+    Reads the plan and never changes it, so calls for different tasks (or the
+    same one) may run on different threads at once.
     """
     try:
-        var table_dir = _in(dir_ptr, dir_len)
-        var decoded = _decode_ticket(_in(ticket_ptr, ticket_len))
-        var paths = List[String]()
-        paths.append(decoded[3])
-        var starts = List[Int64]()
-        starts.append(decoded[1])
-
-        var scan = _configure(
-            _open(table_dir).use_snapshot(decoded[0]),
-            _in(columns_ptr, columns_len),
-            _in(filter_ptr, filter_len),
-        ).with_split_size(_split_size(split_size))
-        var batches = scan.to_batches_for_splits(
-            paths^, starts^, ScanOptions()
+        ref p = _plan_at(plan)[]
+        if index < 0 or index >= len(p.tasks):
+            raise Error(
+                "mlake: task " + String(index) + " of " + String(len(p.tasks))
+            )
+        ref t = p.tasks[index]
+        var parts = read_data_file(
+            p.io,
+            t.data_file,
+            t.delete_files,
+            t.data_sequence_number,
+            p.specs[index],
+            p.schema,
+            p.ids,
+            p.meta_columns,
+            p.mapping,
+            t.residual,
+            p.case_sensitive,
+            ScanOptions(),
+            t.start,
+            t.length,
         )
 
+        # Popped from the back, so reverse first to keep the file's order.
+        var rev = List[ScanResult]()
+        for _ in range(len(parts)):
+            rev.append(parts.pop())
         var exported = List[ExportedArray]()
-        for bi in range(len(batches)):
-            ref b = batches[bi]
+        while len(rev) > 0:
+            var part = rev.pop()
+            if part.num_rows() == 0:
+                continue
+            var b = part^.take_batch()
             # A record batch is a struct array with one child per column; the
             # scan hands back the columns loose, so the struct is added here.
             var row = ArrayData(ArrowType(AT_STRUCT), String("row"))
@@ -370,12 +375,12 @@ def mlake_read_split(
             exported.append(export_c(b.arena, root))
 
         if len(exported) == 0:
-            # Every row of the split was deleted or filtered away. The stream
+            # Every row of the task was deleted or filtered away. The stream
             # still has to carry the schema, so it gets one empty batch.
-            var schema = scan.schema()
+            var projected = p.schema.select(p.ids)
             var arena = ArrayArena()
             var root = empty_tree(
-                arena, schema.store, schema.root, String("row"), 0, False
+                arena, projected.store, projected.root, String("row"), 0, False
             )
             exported.append(export_c(arena, root))
 

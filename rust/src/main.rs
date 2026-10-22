@@ -6,7 +6,7 @@
 //!
 //! The table is registered under its directory's name (`.../db/taxi` →
 //! `taxi`); `--name` overrides it, `--split-size` divides files into smaller
-//! tickets, and `--explain` prints the physical plan instead of running it.
+//! tasks, and `--explain` prints the physical plan instead of running it.
 
 use std::sync::Arc;
 
