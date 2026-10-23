@@ -7,7 +7,7 @@ description = "The C ABI the DataFusion TableProvider calls into: Iceberg scan p
 platforms = ["osx-arm64", "linux-64"]
 
 [dependencies]
-mojo = "==1.1.0"
+mojo = "==1.2.0"
 
 # The include list is the read stack: iceberg needs avro and parquet (and its
 # `full/` codecs), parquet needs arrow, deflate, thrift and the codecs, arrow
