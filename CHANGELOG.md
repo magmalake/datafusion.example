@@ -10,8 +10,8 @@ so it is not versioned.
 ## [Unreleased]
 
 ### Changed
-- **Mojo 1.2.0.** The bridge builds with `mojo ==1.2.0`, from the sibling
-  source trees as before. No source changes.
+- **Mojo 1.3 nightly.** The bridge builds with `mojo ==1.3.0.dev2026111805`,
+  from the sibling source trees as before. Mojo 1.2.0 is no longer supported.
 - **A plan is now a handle held by the bridge.** `mlake_plan` takes the
   column selection with the filter, plans once, and returns a handle to the
   file scan tasks and everything a read needs. `mlake_plan_read` reads one
