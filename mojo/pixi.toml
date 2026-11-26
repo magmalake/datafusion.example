@@ -10,7 +10,7 @@ platforms = ["osx-arm64", "linux-64"]
 # build with the same pinned Mojo nightly, which moves across magmalake
 # together.
 [dependencies]
-mojo = "==1.3.0.dev2026112505"
+mojo = "==1.3.0.dev2026112605"
 
 # The include list is the read stack: iceberg needs avro and parquet (and its
 # `full/` codecs), parquet needs arrow, deflate, thrift and the codecs, arrow
